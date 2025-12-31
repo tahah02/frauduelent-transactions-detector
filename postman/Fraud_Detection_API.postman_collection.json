@@ -1,0 +1,92 @@
+{
+	"info": {
+		"name": "Fraud Detection API",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseURL",
+			"value": "http://127.0.0.1:8000"
+		},
+		{
+			"key": "customer_id",
+			"value": ""
+		},
+		{
+			"key": "account_no",
+			"value": ""
+		},
+		{
+			"key": "txn_id",
+			"value": ""
+		}
+	],
+	"item": [
+		{
+			"name": "Health Check",
+			"request": {
+				"method": "GET",
+				"url": "{{baseURL}}/health"
+			}
+		},
+		{
+			"name": "Process Transaction",
+			"request": {
+				"method": "POST",
+				"url": "{{baseURL}}/api/v1/transaction/analyze",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"customer_id\": 4424492,\n    \"account_no\": 14424492014,\n    \"amount\": 5000,\n    \"transfer_type\": \"S\",\n    \"ben_id\": 2584644,\n    \"bank_country\": \"Germany\"\n}"
+				}
+			}
+		},
+		{
+			"name": "Account Limits",
+			"request": {
+				"method": "GET",
+				"url": "{{baseURL}}/api/v1/account/limits/{{customer_id}}/{{account_no}}"
+			}
+		},
+		{
+			"name": "Session Stats",
+			"request": {
+				"method": "GET",
+				"url": "{{baseURL}}/api/v1/session/stats/{{customer_id}}/{{account_no}}"
+			}
+		},
+		{
+			"name": "Clear Session",
+			"request": {
+				"method": "POST",
+				"url": "{{baseURL}}/api/v1/session/clear"
+			}
+		},
+		{
+			"name": "Get Pending Transactions",
+			"request": {
+				"method": "GET",
+				"url": "{{baseURL}}/api/v1/pending/{{customer_id}}/{{account_no}}"
+			}
+		},
+		{
+			"name": "Approve Pending Transaction",
+			"request": {
+				"method": "POST",
+				"url": "{{baseURL}}/api/v1/pending/approve/{{customer_id}}/{{account_no}}/{{txn_id}}"
+			}
+		},
+		{
+			"name": "Reject Pending Transaction",
+			"request": {
+				"method": "POST",
+				"url": "{{baseURL}}/api/v1/pending/reject/{{customer_id}}/{{account_no}}/{{txn_id}}"
+			}
+		}
+	]
+}
