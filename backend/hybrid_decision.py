@@ -1,14 +1,21 @@
 import pandas as pd
 import numpy as np
+from typing import Dict, Any, List, Optional
 from backend.rule_engine import check_rule_violation
+from backend.config import get_config
+from backend.features import get_feature_vector, get_ml_features, validate_features
+from backend.logging_config import get_logger, log_model_performance
+import time
+
+logger = get_logger('decision')
+config = get_config()
 
 
-TRANSFER_TYPE_ENCODED = {'S': 4, 'I': 1, 'L': 2, 'Q': 3, 'O': 0}
-TRANSFER_TYPE_RISK = {'S': 0.9, 'I': 0.1, 'L': 0.2, 'Q': 0.5, 'O': 0.0}
-
-
-def make_decision(txn, user_stats, model, features, autoencoder=None, scaler=None):
-    result = {
+def make_decision(transaction_data: Dict[str, Any], user_statistics: Dict[str, Any], 
+                 ml_model: Any, feature_names: List[str], autoencoder_model: Any = None, 
+                 feature_scaler: Any = None) -> Dict[str, Any]:
+    """Make fraud decision using triple-layer approach with performance logging"""
+    decision_result = {
         "is_fraud": False,
         "reasons": [],
         "risk_score": 0.0,
@@ -19,57 +26,100 @@ def make_decision(txn, user_stats, model, features, autoencoder=None, scaler=Non
         "ae_threshold": None,
     }
 
-    # Rule Engine
-    violated, rule_reasons, threshold = check_rule_violation(
-        amount=txn.get("amount", 0),
-        user_avg=user_stats.get("user_avg_amount", 0),
-        user_std=user_stats.get("user_std_amount", 0),
-        transfer_type=txn.get("transfer_type", "O"),
-        txn_count_10min=txn.get("txn_count_10min", 1),
-        txn_count_1hour=txn.get("txn_count_1hour", 1),
-        monthly_spending=user_stats.get("current_month_spending", 0),
-    )
+    logger.debug(f"Starting fraud decision for amount: {transaction_data.get('amount', 0)}")
 
-    result["threshold"] = threshold
-    if violated:
-        result["is_fraud"] = True
-        result["reasons"].extend(rule_reasons)
+    # Rule Engine
+    try:
+        rule_violated, rule_violation_reasons, rule_threshold = check_rule_violation(
+            amount=transaction_data.get("amount", 0),
+            user_avg=user_statistics.get("user_avg_amount", 0),
+            user_std=user_statistics.get("user_std_amount", 0),
+            transfer_type=transaction_data.get("transfer_type", "O"),
+            txn_count_10min=transaction_data.get("txn_count_10min", 1),
+            txn_count_1hour=transaction_data.get("txn_count_1hour", 1),
+            monthly_spending=user_statistics.get("current_month_spending", 0),
+        )
+
+        decision_result["threshold"] = rule_threshold
+        if rule_violated:
+            decision_result["is_fraud"] = True
+            decision_result["reasons"].extend(rule_violation_reasons)
+            logger.info(f"Rule engine flagged transaction: {len(rule_violation_reasons)} violations")
+        else:
+            logger.debug("Rule engine passed")
+            
+    except Exception as e:
+        logger.error(f"Rule engine error: {e}")
+        # Continue without rule engine
 
     # Isolation Forest
-    if model is not None and features is not None:
-        ml_features = build_ml_features(txn, user_stats, features)
-        vec = np.array([ml_features])
-        
-        if scaler is not None:
-            vec = scaler.transform(vec)
-        
-        pred = model.predict(vec)[0]
-        score = -model.decision_function(vec)[0]
-        result["risk_score"] = float(score)
+    if ml_model is not None and feature_names is not None:
+        try:
+            ml_prediction_start_time = time.time()
+            ml_feature_dictionary = build_ml_features(transaction_data, user_statistics)
+            ml_feature_vector = get_feature_vector(ml_feature_dictionary, feature_names)
+            model_input_vector = np.array([ml_feature_vector])
+            
+            if feature_scaler is not None:
+                model_input_vector = feature_scaler.transform(model_input_vector)
+            
+            model_prediction = ml_model.predict(model_input_vector)[0]
+            anomaly_score = -ml_model.decision_function(model_input_vector)[0]
+            decision_result["risk_score"] = float(anomaly_score)
+            
+            ml_prediction_time = (time.time() - ml_prediction_start_time) * 1000
+            log_model_performance("isolation_forest", ml_prediction_time, True)
 
-        if pred == -1:
-            result["ml_flag"] = True
-            result["is_fraud"] = True
-            result["reasons"].append(f"ML anomaly detected (risk score {score:.4f})")
+            if model_prediction == -1:
+                decision_result["ml_flag"] = True
+                decision_result["is_fraud"] = True
+                decision_result["reasons"].append(f"ML anomaly detected (risk score {anomaly_score:.4f})")
+                logger.info(f"ML model flagged transaction: risk score {anomaly_score:.4f}")
+            else:
+                logger.debug(f"ML model passed: risk score {anomaly_score:.4f}")
+                
+        except Exception as e:
+            logger.error(f"ML model prediction error: {e}")
+            log_model_performance("isolation_forest", 0, False)
+    else:
+        logger.warning("ML model not available")
 
     # Autoencoder
-    if autoencoder is not None and autoencoder.is_available():
-        ae_features = build_ae_features(txn, user_stats)
-        ae_result = autoencoder.score_transaction(ae_features)
-        
-        if ae_result is not None:
-            result["ae_reconstruction_error"] = ae_result['reconstruction_error']
-            result["ae_threshold"] = ae_result['threshold']
+    if autoencoder_model is not None and autoencoder_model.is_available():
+        try:
+            ae_prediction_start_time = time.time()
+            autoencoder_features = build_ae_features(transaction_data, user_statistics)
+            autoencoder_result = autoencoder_model.score_transaction(autoencoder_features)
             
-            if ae_result['is_anomaly']:
-                result["ae_flag"] = True
-                result["is_fraud"] = True
-                result["reasons"].append(ae_result['reason'])
+            ae_prediction_time = (time.time() - ae_prediction_start_time) * 1000
+            
+            if autoencoder_result is not None:
+                decision_result["ae_reconstruction_error"] = autoencoder_result['reconstruction_error']
+                decision_result["ae_threshold"] = autoencoder_result['threshold']
+                
+                log_model_performance("autoencoder", ae_prediction_time, True)
+                
+                if autoencoder_result['is_anomaly']:
+                    decision_result["ae_flag"] = True
+                    decision_result["is_fraud"] = True
+                    decision_result["reasons"].append(autoencoder_result['reason'])
+                    logger.info(f"Autoencoder flagged transaction: error {autoencoder_result['reconstruction_error']:.4f}")
+                else:
+                    logger.debug(f"Autoencoder passed: error {autoencoder_result['reconstruction_error']:.4f}")
+            else:
+                log_model_performance("autoencoder", ae_prediction_time, False)
+                
+        except Exception as e:
+            logger.error(f"Autoencoder prediction error: {e}")
+            log_model_performance("autoencoder", 0, False)
+    else:
+        logger.debug("Autoencoder not available")
 
-    return result
+    logger.debug(f"Decision complete: fraud={decision_result['is_fraud']}, reasons={len(decision_result['reasons'])}")
+    return decision_result
 
 
-def build_ml_features(txn, user_stats, features):
+def build_ml_features(txn, user_stats):
     transfer_type = txn.get('transfer_type', 'O')
     amount = txn.get('amount', 0)
     user_avg = user_stats.get('user_avg_amount', 0)
@@ -78,8 +128,8 @@ def build_ml_features(txn, user_stats, features):
     feature_values = {
         'transaction_amount': amount,
         'flag_amount': 1 if transfer_type == 'S' else 0,
-        'transfer_type_encoded': TRANSFER_TYPE_ENCODED.get(transfer_type, 0),
-        'transfer_type_risk': TRANSFER_TYPE_RISK.get(transfer_type, 0.5),
+        'transfer_type_encoded': config.TRANSFER_TYPE_ENCODED.get(transfer_type, 0),
+        'transfer_type_risk': config.TRANSFER_TYPE_RISK.get(transfer_type, 0.5),
         'channel_encoded': txn.get('channel_encoded', 0),
         'hour': txn.get('hour', 12),
         'day_of_week': txn.get('day_of_week', 0),
@@ -104,7 +154,7 @@ def build_ml_features(txn, user_stats, features):
         'recent_burst': 1 if txn.get('time_since_last', 3600) < 300 else 0,
     }
     
-    return [feature_values.get(f, 0) for f in features]
+    return feature_values
 
 
 def build_ae_features(txn, user_stats):
@@ -117,8 +167,8 @@ def build_ae_features(txn, user_stats):
     return {
         'transaction_amount': amount,
         'flag_amount': 1 if transfer_type == 'S' else 0,
-        'transfer_type_encoded': TRANSFER_TYPE_ENCODED.get(transfer_type, 0),
-        'transfer_type_risk': TRANSFER_TYPE_RISK.get(transfer_type, 0.5),
+        'transfer_type_encoded': config.TRANSFER_TYPE_ENCODED.get(transfer_type, 0),
+        'transfer_type_risk': config.TRANSFER_TYPE_RISK.get(transfer_type, 0.5),
         'channel_encoded': txn.get('channel_encoded', 0),
         'deviation_from_avg': abs(amount - user_avg),
         'amount_to_max_ratio': amount / max(user_max, 1),

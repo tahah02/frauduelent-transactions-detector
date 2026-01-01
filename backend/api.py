@@ -1,23 +1,63 @@
 import os
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Optional
-from fastapi import FastAPI, HTTPException
+from typing import Optional, Dict, Any, List
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel
+import time
+import asyncio
 
 from backend.model import load_model
 from backend.autoencoder import AutoencoderInference
 from backend.hybrid_decision import make_decision
+from backend.config import get_config
+from backend.exceptions import (
+    ModelLoadError, AccountNotFoundError, InvalidTransactionError,
+    DataValidationError, create_error_response
+)
+from backend.logging_config import (
+    get_logger, set_correlation_id, log_transaction_start, 
+    log_transaction_result, log_system_health
+)
+from backend.cache import (
+    get_cached_account_stats, set_cached_account_stats,
+    get_cached_beneficiary_stats, set_cached_beneficiary_stats,
+    velocity_tracker, get_cache_stats, cleanup_all_caches
+)
+
+logger = get_logger('api')
+config = get_config()
+app = FastAPI(title=config.API_TITLE, version=config.API_VERSION)
+
+# Add middleware for correlation ID
+@app.middleware("http")
+async def add_correlation_id(request: Request, call_next):
+    """Add correlation ID to each request"""
+    correlation_id = set_correlation_id()
+    
+    # Log request start
+    logger.info(f"Request started: {request.method} {request.url.path}")
+    
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = (time.time() - start_time) * 1000
+    
+    # Log request completion
+    logger.info(f"Request completed: {response.status_code} in {process_time:.2f}ms")
+    
+    # Add correlation ID to response headers
+    response.headers["X-Correlation-ID"] = correlation_id
+    
+    return response
 
 
-app = FastAPI(title="Transaction Fraud Detection API", version="1.0.0")
-
+# Global variables
 model, features, scaler = None, None, None
 autoencoder = None
 df_features = None
 session_transactions = {}
 pending_transactions = {}
-TRANSACTION_HISTORY_FILE = 'transaction_history.csv'
+TRANSACTION_HISTORY_FILE = config.TRANSACTION_HISTORY_PATH
 
 
 class TransactionRequest(BaseModel):
@@ -43,63 +83,252 @@ class TransactionResponse(BaseModel):
 
 
 @app.on_event("startup")
+async def startup_event():
+    """Startup tasks including model loading and background tasks"""
+    load_models()
+    
+    # Start background cache cleanup task
+    asyncio.create_task(periodic_cache_cleanup())
+
+
+async def periodic_cache_cleanup():
+    """Background task for periodic cache cleanup"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Run every 5 minutes
+            cleanup_stats = cleanup_all_caches()
+            total_cleaned = sum(cleanup_stats.values())
+            if total_cleaned > 0:
+                logger.info(f"Periodic cleanup: {total_cleaned} entries removed")
+        except Exception as e:
+            logger.error(f"Error in periodic cache cleanup: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    logger.info("Application shutting down...")
+    cleanup_all_caches()
+
+
 def load_models():
+    """Load models with comprehensive error handling"""
     global model, features, scaler, autoencoder, df_features
     
-    print("Loading models...")
-    model, features, scaler = load_model()
+    logger.info("=== FRAUD DETECTION SYSTEM STARTUP ===")
     
-    autoencoder = AutoencoderInference()
-    autoencoder.load_artifacts()
-    
-    df_features = pd.read_csv('data/featured_dataset.csv')
-    print(f"Loaded {len(df_features)} records from featured_dataset.csv")
-    print("Models loaded successfully!")
+    try:
+        # Load ML models
+        try:
+            model, features, scaler = load_model()
+            log_system_health("isolation_forest", "loaded", {"features": len(features)})
+        except ModelLoadError as e:
+            logger.error(f"Failed to load Isolation Forest: {e}")
+            model, features, scaler = None, None, None
+            log_system_health("isolation_forest", "failed", {"error": str(e)})
+        
+        # Load autoencoder
+        try:
+            autoencoder = AutoencoderInference()
+            if autoencoder.load_artifacts():
+                log_system_health("autoencoder", "loaded")
+            else:
+                logger.warning("Autoencoder artifacts not available")
+                autoencoder = None
+                log_system_health("autoencoder", "unavailable")
+        except Exception as e:
+            logger.error(f"Failed to load Autoencoder: {e}")
+            autoencoder = None
+            log_system_health("autoencoder", "failed", {"error": str(e)})
+        
+        # Load feature data
+        try:
+            df_features = pd.read_csv(config.FEATURED_CSV_PATH)
+            log_system_health("feature_data", "loaded", {"records": len(df_features)})
+        except Exception as e:
+            logger.error(f"Failed to load feature data: {e}")
+            df_features = pd.DataFrame()
+            log_system_health("feature_data", "failed", {"error": str(e)})
+        
+        # System health summary
+        models_loaded = sum([
+            model is not None,
+            autoencoder is not None,
+            not df_features.empty
+        ])
+        
+        if models_loaded == 0:
+            logger.critical("No models loaded successfully - system will have limited functionality")
+            log_system_health("system", "degraded", {"components_loaded": f"{models_loaded}/3"})
+        else:
+            logger.info(f"System startup complete: {models_loaded}/3 components loaded")
+            log_system_health("system", "operational", {"components_loaded": f"{models_loaded}/3"})
+            
+    except Exception as e:
+        logger.critical(f"Critical error during startup: {e}")
+        log_system_health("system", "critical_error", {"error": str(e)})
 
 
-def get_account_stats(customer_id: float, account_no: float) -> dict:
-    account_data = df_features[
-        (df_features['CustomerId'] == customer_id) & 
-        (df_features['FromAccountNo'] == account_no)
-    ]
-    
-    if account_data.empty:
-        return None
-    
-    latest = account_data.iloc[-1]
-    
+def get_account_stats(customer_id: float, account_no: float) -> Dict[str, Any]:
+    """Get account statistics with caching and error handling"""
+    try:
+        # Validate inputs
+        if customer_id <= 0:
+            raise InvalidTransactionError(
+                "Invalid customer ID",
+                error_code="INVALID_TRANSACTION",
+                context={'customer_id': customer_id}
+            )
+        
+        if account_no <= 0:
+            raise InvalidTransactionError(
+                "Invalid account number",
+                error_code="INVALID_TRANSACTION", 
+                context={'account_no': account_no}
+            )
+        
+        # Try cache first
+        cached_account_stats = get_cached_account_stats(customer_id, account_no)
+        if cached_account_stats is not None:
+            logger.debug(f"Account stats cache hit for {customer_id}/{account_no}")
+            return cached_account_stats
+        
+        # Check if data is available
+        if df_features.empty:
+            logger.warning("Feature data not available, using defaults")
+            return get_default_account_stats()
+        
+        # Query account data
+        account_data_df = df_features[
+            (df_features['CustomerId'] == customer_id) & 
+            (df_features['FromAccountNo'] == account_no)
+        ]
+        
+        if account_data_df.empty:
+            raise AccountNotFoundError(
+                f"Account not found: Customer {customer_id}, Account {account_no}",
+                error_code="ACCOUNT_NOT_FOUND",
+                context={'customer_id': customer_id, 'account_no': account_no}
+            )
+        
+        latest_record = account_data_df.iloc[-1]
+        
+        account_statistics = {
+            'user_avg_amount': latest_record.get('user_avg_amount', 0),
+            'user_std_amount': latest_record.get('user_std_amount', 0),
+            'user_max_amount': latest_record.get('user_max_amount', 0),
+            'user_txn_frequency': latest_record.get('user_txn_frequency', 0),
+            'intl_ratio': latest_record.get('intl_ratio', 0),
+            'user_high_risk_txn_ratio': latest_record.get('user_high_risk_txn_ratio', 0),
+            'user_multiple_accounts_flag': latest_record.get('user_multiple_accounts_flag', 0),
+            'cross_account_transfer_ratio': latest_record.get('cross_account_transfer_ratio', 0),
+            'rolling_std': latest_record.get('rolling_std', 0),
+            'transaction_velocity': latest_record.get('transaction_velocity', 1),
+            'current_month_spending': latest_record.get('current_month_spending', 0),
+        }
+        
+        # Cache the result
+        set_cached_account_stats(customer_id, account_no, account_statistics)
+        logger.debug(f"Account stats cached for {customer_id}/{account_no}")
+        
+        return account_statistics
+        
+    except (InvalidTransactionError, AccountNotFoundError) as e:
+        # Re-raise known errors
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error getting account stats: {e}")
+        # Return default stats as fallback
+        return get_default_account_stats()
+
+
+def get_default_account_stats() -> Dict[str, Any]:
+    """Return default account statistics when data is unavailable"""
     return {
-        'user_avg_amount': latest.get('user_avg_amount', 0),
-        'user_std_amount': latest.get('user_std_amount', 0),
-        'user_max_amount': latest.get('user_max_amount', 0),
-        'user_txn_frequency': latest.get('user_txn_frequency', 0),
-        'intl_ratio': latest.get('intl_ratio', 0),
-        'user_high_risk_txn_ratio': latest.get('user_high_risk_txn_ratio', 0),
-        'user_multiple_accounts_flag': latest.get('user_multiple_accounts_flag', 0),
-        'cross_account_transfer_ratio': latest.get('cross_account_transfer_ratio', 0),
-        'rolling_std': latest.get('rolling_std', 0),
-        'transaction_velocity': latest.get('transaction_velocity', 1),
-        'current_month_spending': latest.get('current_month_spending', 0),
+        'user_avg_amount': 1000,
+        'user_std_amount': 500,
+        'user_max_amount': 5000,
+        'user_txn_frequency': 10,
+        'intl_ratio': 0.1,
+        'user_high_risk_txn_ratio': 0.2,
+        'user_multiple_accounts_flag': 0,
+        'cross_account_transfer_ratio': 0.1,
+        'rolling_std': 300,
+        'transaction_velocity': 1,
+        'current_month_spending': 2000,
     }
 
 
-def add_to_session(customer_id: float, account_no: float, amount: float):
-    key = (customer_id, account_no)
-    now = datetime.now()
+def add_to_session(customer_id: float, account_no: float, amount: float) -> None:
+    """Add transaction to session using efficient velocity tracker"""
+    velocity_tracker.add_transaction(customer_id, account_no, amount)
+    logger.debug(f"Added transaction to velocity tracker: {customer_id}/{account_no}, amount: {amount}")
+
+
+def get_velocity_stats(customer_id: float, account_no: float) -> Dict[str, Any]:
+    """Get velocity statistics using efficient tracker"""
+    # Get historical data from CSV (if available)
+    historical_velocity_data = {'txn_count_10min': 0, 'txn_count_1hour': 0, 'txn_count_30s': 0}
     
-    if key not in session_transactions:
-        session_transactions[key] = []
+    if not df_features.empty:
+        account_historical_data = df_features[
+            (df_features['CustomerId'] == customer_id) & 
+            (df_features['FromAccountNo'] == account_no)
+        ]
+        
+        if not account_historical_data.empty:
+            latest_historical_record = account_historical_data.iloc[-1]
+            historical_velocity_data = {
+                'txn_count_10min': latest_historical_record.get('txn_count_10min', 0),
+                'txn_count_1hour': latest_historical_record.get('txn_count_1hour', 0),
+                'txn_count_30s': latest_historical_record.get('txn_count_30s', 0),
+            }
+
+    # Get real-time session data from velocity tracker
+    session_velocity_stats = velocity_tracker.get_velocity_stats(customer_id, account_no)
     
-    session_transactions[key].append({
-        'amount': amount,
-        'timestamp': now
-    })
+    # Combine historical and session data
+    return {
+        'txn_count_30s': session_velocity_stats['txn_count_30s'],
+        'txn_count_10min': session_velocity_stats['txn_count_10min'],
+        'txn_count_1hour': session_velocity_stats['txn_count_1hour'],
+        'time_since_last': session_velocity_stats['time_since_last'],
+        'session_spending': session_velocity_stats['session_spending'],
+    }
+
+
+def get_beneficiary_stats(ben_id: float) -> Dict[str, Any]:
+    """Get beneficiary statistics with caching"""
+    if ben_id is None or ben_id <= 0:
+        return {'is_new_beneficiary': 1, 'beneficiary_txn_count_30d': 0, 'beneficiary_risk_score': 0.5}
     
-    # Clean old transactions (older than 1 hour)
-    cutoff = now - timedelta(hours=1)
-    session_transactions[key] = [
-        t for t in session_transactions[key] if t['timestamp'] > cutoff
-    ]
+    # Try cache first
+    cached_beneficiary_stats = get_cached_beneficiary_stats(ben_id)
+    if cached_beneficiary_stats is not None:
+        logger.debug(f"Beneficiary stats cache hit for {ben_id}")
+        return cached_beneficiary_stats
+    
+    # Query from data
+    if df_features.empty:
+        beneficiary_statistics = {'is_new_beneficiary': 1, 'beneficiary_txn_count_30d': 0, 'beneficiary_risk_score': 0.5}
+    else:
+        beneficiary_data_df = df_features[df_features['BenId'] == ben_id]
+        
+        if beneficiary_data_df.empty:
+            beneficiary_statistics = {'is_new_beneficiary': 1, 'beneficiary_txn_count_30d': 0, 'beneficiary_risk_score': 0.5}
+        else:
+            latest_beneficiary_record = beneficiary_data_df.iloc[-1]
+            beneficiary_statistics = {
+                'is_new_beneficiary': 0,
+                'beneficiary_txn_count_30d': latest_beneficiary_record.get('beneficiary_txn_count_30d', 0),
+                'beneficiary_risk_score': latest_beneficiary_record.get('beneficiary_risk_score', 0.5),
+            }
+    
+    # Cache the result
+    set_cached_beneficiary_stats(ben_id, beneficiary_statistics)
+    logger.debug(f"Beneficiary stats cached for {ben_id}")
+    
+    return beneficiary_statistics
 
 
 def add_to_pending(customer_id: float, account_no: float, amount: float, 
@@ -138,179 +367,176 @@ def save_to_history(customer_id: float, account_no: float, amount: float,
         f.write(f'{customer_id},{account_no},{amount},{transfer_type},{status},{now}\n')
 
 
-def get_session_velocity(customer_id: float, account_no: float) -> dict:
-    key = (customer_id, account_no)
-    now = datetime.now()
-    
-    if key not in session_transactions or len(session_transactions[key]) == 0:
-        return {
-            'session_txn_count_30s': 0,
-            'session_txn_count_10min': 0,
-            'session_txn_count_1hour': 0,
-            'session_spending': 0,
-            'time_since_last': 3600
-        }
-    
-    txns = session_transactions[key]
-
-    count_30s = sum(1 for t in txns if (now - t['timestamp']).total_seconds() <= 30)
-    count_10min = sum(1 for t in txns if (now - t['timestamp']).total_seconds() <= 600)
-    count_1hour = sum(1 for t in txns if (now - t['timestamp']).total_seconds() <= 3600)
-    
-
-    session_spending = sum(t['amount'] for t in txns)
-    
-    if len(txns) > 1:
-        sorted_txns = sorted(txns, key=lambda x: x['timestamp'], reverse=True)
-        time_since_last = (now - sorted_txns[1]['timestamp']).total_seconds()
-    else:
-        time_since_last = 3600
-    
-    return {
-        'session_txn_count_30s': count_30s,
-        'session_txn_count_10min': count_10min,
-        'session_txn_count_1hour': count_1hour,
-        'session_spending': session_spending,
-        'time_since_last': time_since_last
-    }
-
-
-def get_velocity_stats(customer_id: float, account_no: float) -> dict:
-    account_data = df_features[
-        (df_features['CustomerId'] == customer_id) & 
-        (df_features['FromAccountNo'] == account_no)
-    ]
-    
-    historical = {'txn_count_10min': 0, 'txn_count_1hour': 0, 'txn_count_30s': 0}
-    if not account_data.empty:
-        latest = account_data.iloc[-1]
-        historical = {
-            'txn_count_10min': latest.get('txn_count_10min', 0),
-            'txn_count_1hour': latest.get('txn_count_1hour', 0),
-            'txn_count_30s': latest.get('txn_count_30s', 0),
-        }
-
-    session = get_session_velocity(customer_id, account_no)
-    return {
-        'txn_count_30s': session['session_txn_count_30s'],
-        'txn_count_10min': session['session_txn_count_10min'],
-        'txn_count_1hour': session['session_txn_count_1hour'],
-        'time_since_last': session['time_since_last'],
-        'session_spending': session['session_spending'],
-    }
-
-
-def get_beneficiary_stats(ben_id: float) -> dict:
-    if ben_id is None or ben_id <= 0:
-        return {'is_new_beneficiary': 1, 'beneficiary_txn_count_30d': 0, 'beneficiary_risk_score': 0.5}
-    
-    ben_data = df_features[df_features['BenId'] == ben_id]
-    
-    if ben_data.empty:
-        return {'is_new_beneficiary': 1, 'beneficiary_txn_count_30d': 0, 'beneficiary_risk_score': 0.5}
-    
-    latest = ben_data.iloc[-1]
-    
-    return {
-        'is_new_beneficiary': 0,
-        'beneficiary_txn_count_30d': latest.get('beneficiary_txn_count_30d', 0),
-        'beneficiary_risk_score': latest.get('beneficiary_risk_score', 0.5),
-    }
-
 
 @app.post("/api/v1/transaction/analyze", response_model=TransactionResponse)
 def analyze_transaction(request: TransactionRequest):
-
-    user_stats = get_account_stats(request.customer_id, request.account_no)
-    
-    if user_stats is None:
-        raise HTTPException(status_code=404, detail="Account not found")
-    
-    velocity = get_velocity_stats(request.customer_id, request.account_no)
-    
-    user_stats['current_month_spending'] = (
-        user_stats.get('current_month_spending', 0) + velocity['session_spending']
-    )
-    
-    ben_stats = get_beneficiary_stats(request.ben_id)
-
-    local_countries = ['UAE', 'AE', 'United Arab Emirates', 'AJMAN']
-    geo_anomaly = 0 if request.bank_country.upper() in [c.upper() for c in local_countries] else 1
-
-    now = datetime.now()
-    txn = {
-        'amount': request.amount,
-        'transfer_type': request.transfer_type.upper(),
-        'txn_count_10min': velocity['txn_count_10min'] + 1,
-        'txn_count_1hour': velocity['txn_count_1hour'] + 1,
-        'txn_count_30s': velocity.get('txn_count_30s', 0) + 1,
-        'time_since_last': velocity['time_since_last'],
-        'hour': now.hour,
-        'day_of_week': now.weekday(),
-        'is_weekend': 1 if now.weekday() >= 5 else 0,
-        'is_night': 1 if now.hour < 6 or now.hour >= 22 else 0,
-        'channel_encoded': 0,
-        'geo_anomaly_flag': geo_anomaly,
-        **ben_stats,
-    }
-
-    result = make_decision(txn, user_stats, model, features, autoencoder, scaler)
-    
-
-    if result['is_fraud']:
-        status = "AWAITING_USER_CONFIRMATION"
-        message = "Unusual activity detected. Please confirm this transaction."
-        # Add to pending (NOT to session)
-        txn_id = add_to_pending(
-            request.customer_id, request.account_no, request.amount,
-            request.transfer_type.upper(), request.ben_id or 0, 
-            request.bank_country, result['reasons']
+    """Analyze transaction with comprehensive error handling"""
+    try:
+        # Log transaction start
+        log_transaction_start(
+            request.customer_id, request.account_no, 
+            request.amount, request.transfer_type
         )
-
-        save_to_history(request.customer_id, request.account_no, request.amount,
-                       request.transfer_type.upper(), "Awaiting Confirmation")
-    else:
-        status = "APPROVED"
-        message = "Transaction is safe to process"
-        txn_id = None 
-        add_to_session(request.customer_id, request.account_no, request.amount)
-        save_to_history(request.customer_id, request.account_no, request.amount,
-                       request.transfer_type.upper(), "Approved")
-    
-
-    from backend.rule_engine import calculate_threshold
-    applied_limit = calculate_threshold(
-        user_stats['user_avg_amount'], 
-        user_stats['user_std_amount'], 
-        request.transfer_type.upper()
-    )
-    
-
-    if result['risk_score'] < 0:
-        risk_interpretation = "Normal behavior - transaction pattern is consistent with user history"
-    elif result['risk_score'] < 0.5:
-        risk_interpretation = "Slightly unusual - minor deviation from typical behavior"
-    elif result['risk_score'] < 1.0:
-        risk_interpretation = "Moderately unusual - noticeable deviation from typical behavior"
-    else:
-        risk_interpretation = "Highly unusual - significant anomaly detected in transaction pattern"
-    
-    return TransactionResponse(
-        status=status,
-        message=message,
-        txn_id=txn_id,
-        risk_score=result['risk_score'],
-        risk_interpretation=risk_interpretation,
-        threshold=result['threshold'],
-        transfer_type=request.transfer_type.upper(),
-        applied_limit=round(applied_limit, 2),
-        reasons=result['reasons'],
-        flags={
-            'rule_flag': len([r for r in result['reasons'] if 'Velocity' in r or 'spending' in r]) > 0,
-            'ml_flag': result['ml_flag'],
-            'ae_flag': result['ae_flag'],
+        
+        # Input validation
+        if request.amount <= config.MIN_TRANSACTION_AMOUNT:
+            logger.warning(f"Invalid amount: {request.amount}")
+            raise InvalidTransactionError(
+                "Transaction amount must be positive",
+                error_code="INVALID_TRANSACTION",
+                context={'amount': request.amount}
+            )
+        
+        if request.amount > config.MAX_TRANSACTION_AMOUNT:
+            logger.warning(f"Amount exceeds limit: {request.amount}")
+            raise InvalidTransactionError(
+                "Transaction amount exceeds maximum limit",
+                error_code="INVALID_TRANSACTION",
+                context={'amount': request.amount, 'limit': config.MAX_TRANSACTION_AMOUNT}
+            )
+        
+        # Get account statistics
+        try:
+            user_account_stats = get_account_stats(request.customer_id, request.account_no)
+            logger.debug(f"Account stats retrieved for {request.customer_id}/{request.account_no}")
+        except AccountNotFoundError:
+            logger.warning(f"Unknown account: {request.customer_id}/{request.account_no}, using defaults")
+            user_account_stats = get_default_account_stats()
+        
+        # Get velocity statistics
+        velocity_statistics = get_velocity_stats(request.customer_id, request.account_no)
+        logger.debug(f"Velocity stats: {velocity_statistics['txn_count_10min']} txns in 10min")
+        
+        user_account_stats['current_month_spending'] = (
+            user_account_stats.get('current_month_spending', 0) + velocity_statistics['session_spending']
+        )
+        
+        # Get beneficiary statistics
+        beneficiary_statistics = get_beneficiary_stats(request.ben_id)
+        
+        # Geographic analysis
+        is_geo_anomaly = 0 if config.is_local_country(request.bank_country) else 1
+        if is_geo_anomaly:
+            logger.info(f"Foreign country detected: {request.bank_country}")
+        
+        # Build transaction features
+        current_datetime = datetime.now()
+        transaction_features = {
+            'amount': request.amount,
+            'transfer_type': request.transfer_type.upper(),
+            'txn_count_10min': velocity_statistics['txn_count_10min'] + 1,
+            'txn_count_1hour': velocity_statistics['txn_count_1hour'] + 1,
+            'txn_count_30s': velocity_statistics.get('txn_count_30s', 0) + 1,
+            'time_since_last': velocity_statistics['time_since_last'],
+            'hour': current_datetime.hour,
+            'day_of_week': current_datetime.weekday(),
+            'is_weekend': 1 if current_datetime.weekday() >= 5 else 0,
+            'is_night': 1 if current_datetime.hour < 6 or current_datetime.hour >= 22 else 0,
+            'channel_encoded': 0,
+            'geo_anomaly_flag': is_geo_anomaly,
+            **beneficiary_statistics,
         }
-    )
+        
+        # Make fraud decision with error handling
+        try:
+            decision_start_time = time.time()
+            fraud_decision_result = make_decision(transaction_features, user_account_stats, model, features, autoencoder, scaler)
+            decision_processing_time = (time.time() - decision_start_time) * 1000
+            logger.debug(f"Fraud decision completed in {decision_processing_time:.2f}ms")
+        except Exception as e:
+            logger.error(f"Error in fraud decision: {e}")
+            # Fallback to rule-based decision only
+            logger.info("Falling back to rule-engine only")
+            from backend.rule_engine import check_rule_violation
+            rule_violated, rule_violation_reasons, rule_threshold = check_rule_violation(
+                amount=request.amount,
+                user_avg=user_account_stats.get('user_avg_amount', 0),
+                user_std=user_account_stats.get('user_std_amount', 0),
+                transfer_type=request.transfer_type.upper(),
+                txn_count_10min=transaction_features['txn_count_10min'],
+                txn_count_1hour=transaction_features['txn_count_1hour'],
+                monthly_spending=user_account_stats.get('current_month_spending', 0)
+            )
+            
+            fraud_decision_result = {
+                'is_fraud': rule_violated,
+                'reasons': rule_violation_reasons,
+                'risk_score': 0.5 if rule_violated else 0.0,
+                'threshold': rule_threshold,
+                'ml_flag': False,
+                'ae_flag': False
+            }
+        
+        # Process result and determine status
+        if fraud_decision_result['is_fraud']:
+            transaction_status = "AWAITING_USER_CONFIRMATION"
+            response_message = "Unusual activity detected. Please confirm this transaction."
+            transaction_id = add_to_pending(
+                request.customer_id, request.account_no, request.amount,
+                request.transfer_type.upper(), request.ben_id or 0, 
+                request.bank_country, fraud_decision_result['reasons']
+            )
+            save_to_history(request.customer_id, request.account_no, request.amount,
+                           request.transfer_type.upper(), "Awaiting Confirmation")
+            logger.info(f"Transaction flagged for confirmation: {len(fraud_decision_result['reasons'])} reasons")
+        else:
+            transaction_status = "APPROVED"
+            response_message = "Transaction is safe to process"
+            transaction_id = None 
+            add_to_session(request.customer_id, request.account_no, request.amount)
+            save_to_history(request.customer_id, request.account_no, request.amount,
+                           request.transfer_type.upper(), "Approved")
+            logger.info("Transaction approved")
+        
+        # Calculate applied limit
+        from backend.rule_engine import calculate_threshold
+        calculated_limit = calculate_threshold(
+            user_account_stats['user_avg_amount'], 
+            user_account_stats['user_std_amount'], 
+            request.transfer_type.upper()
+        )
+        
+        # Generate risk interpretation
+        calculated_risk_score = fraud_decision_result.get('risk_score', 0.0)
+        if calculated_risk_score < 0:
+            risk_interpretation_text = "Normal behavior - transaction pattern is consistent with user history"
+        elif calculated_risk_score < 0.5:
+            risk_interpretation_text = "Slightly unusual - minor deviation from typical behavior"
+        elif calculated_risk_score < 1.0:
+            risk_interpretation_text = "Moderately unusual - noticeable deviation from typical behavior"
+        else:
+            risk_interpretation_text = "Highly unusual - significant anomaly detected in transaction pattern"
+        
+        # Log transaction result
+        log_transaction_result(transaction_status, calculated_risk_score, fraud_decision_result.get('reasons', []))
+        
+        return TransactionResponse(
+            status=transaction_status,
+            message=response_message,
+            txn_id=transaction_id,
+            risk_score=calculated_risk_score,
+            risk_interpretation=risk_interpretation_text,
+            threshold=fraud_decision_result.get('threshold', calculated_limit),
+            transfer_type=request.transfer_type.upper(),
+            applied_limit=round(calculated_limit, 2),
+            reasons=fraud_decision_result.get('reasons', []),
+            flags={
+                'rule_flag': len([r for r in fraud_decision_result.get('reasons', []) if 'Velocity' in r or 'spending' in r]) > 0,
+                'ml_flag': fraud_decision_result.get('ml_flag', False),
+                'ae_flag': fraud_decision_result.get('ae_flag', False),
+            }
+        )
+        
+    except (InvalidTransactionError, AccountNotFoundError) as e:
+        logger.error(f"Transaction analysis error: {e}")
+        raise HTTPException(status_code=400, detail=create_error_response(e))
+    except Exception as e:
+        logger.error(f"Unexpected error in transaction analysis: {e}")
+        raise HTTPException(status_code=500, detail={
+            'error': True,
+            'message': 'Internal server error occurred',
+            'technical_message': str(e)
+        })
 
 
 @app.get("/api/v1/account/limits/{customer_id}/{account_no}")
@@ -357,12 +583,44 @@ def health_check():
     return {"status": "healthy", "models_loaded": model is not None}
 
 
+@app.get("/api/v1/system/cache/stats")
+def get_cache_statistics():
+    """Get cache performance statistics"""
+    stats = get_cache_stats()
+    return {
+        "cache_statistics": stats,
+        "message": "Cache statistics retrieved successfully"
+    }
+
+
+@app.post("/api/v1/system/cache/cleanup")
+def cleanup_caches():
+    """Cleanup expired cache entries"""
+    cleanup_stats = cleanup_all_caches()
+    return {
+        "cleanup_results": cleanup_stats,
+        "message": "Cache cleanup completed"
+    }
+
+
 @app.post("/api/v1/session/clear")
 def clear_session():
+    """Clear session data and caches"""
     global session_transactions, pending_transactions
+    
+    # Clear old session storage (if any remains)
     session_transactions = {}
     pending_transactions = {}
-    return {"status": "cleared", "message": "Session and pending transactions cleared"}
+    
+    # Cleanup caches
+    cleanup_stats = cleanup_all_caches()
+    
+    logger.info("Session and cache data cleared")
+    return {
+        "status": "cleared", 
+        "message": "Session and cache data cleared",
+        "cleanup_stats": cleanup_stats
+    }
 
 
 @app.get("/api/v1/pending/{customer_id}/{account_no}")
@@ -476,17 +734,16 @@ def cancel_pending_transaction(customer_id: float, account_no: float, txn_id: st
 
 @app.get("/api/v1/session/stats/{customer_id}/{account_no}")
 def get_session_stats(customer_id: float, account_no: float):
-    velocity = get_session_velocity(customer_id, account_no)
-    key = (customer_id, account_no)
-    txn_count = len(session_transactions.get(key, []))
+    """Get session statistics using efficient velocity tracker"""
+    velocity = velocity_tracker.get_velocity_stats(customer_id, account_no)
     
     return {
         "customer_id": customer_id,
         "account_no": account_no,
-        "total_transactions_in_session": txn_count,
-        "txn_count_30s": velocity['session_txn_count_30s'],
-        "txn_count_10min": velocity['session_txn_count_10min'],
-        "txn_count_1hour": velocity['session_txn_count_1hour'],
+        "total_transactions_in_session": velocity['txn_count_1hour'],
+        "txn_count_30s": velocity['txn_count_30s'],
+        "txn_count_10min": velocity['txn_count_10min'],
+        "txn_count_1hour": velocity['txn_count_1hour'],
         "session_spending": velocity['session_spending'],
         "time_since_last": velocity['time_since_last']
     }

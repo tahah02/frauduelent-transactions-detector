@@ -9,6 +9,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, Model
+from backend.features import get_autoencoder_features
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -82,17 +83,7 @@ class AutoencoderInference:
     SCALER_PATH = 'models/autoencoder_scaler.pkl'
     THRESHOLD_PATH = 'models/autoencoder_threshold.json'
     
-    FEATURES = [
-        'transaction_amount', 'flag_amount', 'transfer_type_encoded', 'transfer_type_risk',
-        'channel_encoded', 'deviation_from_avg', 'amount_to_max_ratio', 'rolling_std',
-        'hour', 'day_of_week', 'is_weekend', 'is_night',
-        'user_avg_amount', 'user_std_amount', 'user_max_amount', 'user_txn_frequency',
-        'intl_ratio', 'user_high_risk_txn_ratio', 'user_multiple_accounts_flag',
-        'cross_account_transfer_ratio', 'time_since_last', 'recent_burst',
-        'txn_count_30s', 'txn_count_10min', 'txn_count_1hour',
-        'transaction_velocity', 'is_new_beneficiary', 'beneficiary_txn_count_30d',
-        'beneficiary_risk_score', 'geo_anomaly_flag', 'current_month_spending'
-    ]
+    FEATURES = get_autoencoder_features()
     
     def __init__(self):
         self.model = None

@@ -1,6 +1,9 @@
 import pandas as pd
 import numpy as np
-from backend.utils import ensure_data_dir, get_clean_csv_path, TRANSFER_TYPE_ENCODED, TRANSFER_TYPE_RISK
+from backend.utils import ensure_data_dir, get_clean_csv_path
+from backend.config import get_config
+
+config = get_config()
 
 
 def engineer_features(output_path='data/featured_dataset.csv'):
@@ -40,8 +43,8 @@ def engineer_features(output_path='data/featured_dataset.csv'):
     
     if 'TransferType' in df.columns:
         df['flag_amount'] = df['TransferType'].apply(lambda x: 1 if str(x).upper() == 'S' else 0)
-        df['transfer_type_encoded'] = df['TransferType'].apply(lambda x: TRANSFER_TYPE_ENCODED.get(str(x).upper(), 0))
-        df['transfer_type_risk'] = df['TransferType'].apply(lambda x: TRANSFER_TYPE_RISK.get(str(x).upper(), 0.5))
+        df['transfer_type_encoded'] = df['TransferType'].apply(lambda x: config.TRANSFER_TYPE_ENCODED.get(str(x).upper(), 0))
+        df['transfer_type_risk'] = df['TransferType'].apply(lambda x: config.TRANSFER_TYPE_RISK.get(str(x).upper(), 0.5))
     else:
         df['flag_amount'], df['transfer_type_encoded'], df['transfer_type_risk'] = 0, 0, 0.5
     
@@ -216,9 +219,8 @@ def engineer_features(output_path='data/featured_dataset.csv'):
     
     # Geo anomaly flag
     if 'BankCountry' in df.columns:
-        local_countries = ['UAE', 'AE', 'United Arab Emirates', 'AJMAN', 'Unknown']
         df['geo_anomaly_flag'] = df['BankCountry'].apply(
-            lambda x: 0 if str(x).upper() in [c.upper() for c in local_countries] else 1
+            lambda x: 0 if str(x).upper() in [c.upper() for c in config.LOCAL_COUNTRIES] else 1
         )
     else:
         df['geo_anomaly_flag'] = df['flag_amount']

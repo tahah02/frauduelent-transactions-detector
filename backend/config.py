@@ -85,6 +85,26 @@ class Config:
     API_TITLE: str = "Transaction Fraud Detection API"
     API_VERSION: str = "1.0.0"
     
+    # Transaction Limits
+    MAX_TRANSACTION_AMOUNT: float = 1000000.0  # 1M AED
+    MIN_TRANSACTION_AMOUNT: float = 0.01       # Minimum valid amount
+    
+    # Cache Settings
+    ACCOUNT_CACHE_TTL: int = 300      # 5 minutes
+    BENEFICIARY_CACHE_TTL: int = 600  # 10 minutes
+    CACHE_MAX_SIZE: int = 1000
+    
+    # Velocity Tracker Settings
+    VELOCITY_BUCKET_SIZE: int = 30    # 30 seconds
+    VELOCITY_CLEANUP_HOURS: int = 2   # Keep 2 hours of data
+    
+    # Background Task Settings
+    CACHE_CLEANUP_INTERVAL: int = 300  # 5 minutes
+    
+    # Request Processing
+    REQUEST_TIMEOUT_SECONDS: int = 30
+    MAX_CONCURRENT_REQUESTS: int = 100
+    
     # Logging Settings
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     LOG_FORMAT: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
