@@ -68,10 +68,18 @@
 			}
 		},
 		{
-			"name": "Get Pending Transactions",
+			"name": "Get Pending Transactions (Account)",
 			"request": {
 				"method": "GET",
 				"url": "{{baseURL}}/api/v1/pending/{{customer_id}}/{{account_no}}"
+			}
+		},
+		{
+			"name": "Get ALL Pending Transactions (Ops)",
+			"request": {
+				"method": "GET",
+				"url": "{{baseURL}}/api/v1/pending/all",
+				"description": "For Operations Teams: Returns ALL pending transactions across all accounts that require manual review."
 			}
 		},
 		{

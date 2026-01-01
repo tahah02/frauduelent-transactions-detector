@@ -44,7 +44,10 @@ class TransactionResponse(BaseModel):
     status: str
     message: str
     risk_score: float
+    risk_interpretation: str  # Explains what the risk score means
     threshold: float
+    transfer_type: str  # Which transfer type was evaluated
+    applied_limit: float  # Customer-specific limit for this transfer type
     reasons: list
     flags: dict
 
@@ -245,8 +248,25 @@ def analyze_transaction(request: TransactionRequest):
     """
     Analyze a transaction and return APPROVED or PENDING_REVIEW.
     
+    **Idempotency:** This endpoint is idempotent per request, not per transaction ID.
+    The same request payload sent multiple times will produce the same decision.
+    The system does not track or deduplicate using a transaction ID.
+    If the same transaction is submitted again as a new request, it will be re-evaluated.
+    
+    **Thresholds:** Spending limits are customer-specific and vary by transfer type.
+    Each customer has different limits based on their historical behavior (avg, std).
+    
+    **Risk Score:** The risk_score is an anomaly signal from ML models, NOT a probability.
+    - Negative values → normal behavior
+    - Positive values → unusual behavior
+    - Higher positive value = more abnormal
+    
+    **Statuses:**
     - APPROVED: Transaction is safe to process (added to session + saved to history)
     - PENDING_REVIEW: Transaction needs manual approval (NOT added to session yet)
+    
+    **For Operations Teams:** Manual review workflows should consume PENDING_REVIEW only.
+    Use /api/v1/pending/all to list all pending transactions for investigation.
     """
     # Get account stats
     user_stats = get_account_stats(request.customer_id, request.account_no)
@@ -312,11 +332,32 @@ def analyze_transaction(request: TransactionRequest):
         save_to_history(request.customer_id, request.account_no, request.amount,
                        request.transfer_type.upper(), "Approved")
     
+    # Calculate customer-specific limit for this transfer type
+    from backend.rule_engine import calculate_threshold
+    applied_limit = calculate_threshold(
+        user_stats['user_avg_amount'], 
+        user_stats['user_std_amount'], 
+        request.transfer_type.upper()
+    )
+    
+    # Generate risk interpretation
+    if result['risk_score'] < 0:
+        risk_interpretation = "Normal behavior - transaction pattern is consistent with user history"
+    elif result['risk_score'] < 0.5:
+        risk_interpretation = "Slightly unusual - minor deviation from typical behavior"
+    elif result['risk_score'] < 1.0:
+        risk_interpretation = "Moderately unusual - noticeable deviation from typical behavior"
+    else:
+        risk_interpretation = "Highly unusual - significant anomaly detected in transaction pattern"
+    
     return TransactionResponse(
         status=status,
         message=message,
         risk_score=result['risk_score'],
+        risk_interpretation=risk_interpretation,
         threshold=result['threshold'],
+        transfer_type=request.transfer_type.upper(),
+        applied_limit=round(applied_limit, 2),
         reasons=result['reasons'],
         flags={
             'rule_flag': len([r for r in result['reasons'] if 'Velocity' in r or 'spending' in r]) > 0,
@@ -407,6 +448,42 @@ def get_pending_transactions(customer_id: float, account_no: float):
             }
             for t in pending
         ]
+    }
+
+
+@app.get("/api/v1/pending/all")
+def get_all_pending_transactions():
+    """
+    Get ALL pending transactions across all accounts.
+    
+    **For Operations Teams:** This endpoint returns all PENDING_REVIEW transactions
+    that require manual investigation, approval, or rejection.
+    
+    Ignore APPROVED transactions - they are already processed.
+    Act only on PENDING_REVIEW cases returned by this endpoint.
+    """
+    all_pending = []
+    
+    for (customer_id, account_no), txns in pending_transactions.items():
+        for t in txns:
+            all_pending.append({
+                "customer_id": customer_id,
+                "account_no": account_no,
+                "txn_id": t['txn_id'],
+                "amount": t['amount'],
+                "transfer_type": t['transfer_type'],
+                "bank_country": t.get('bank_country', 'Unknown'),
+                "reasons": t['reasons'],
+                "timestamp": t['timestamp'].isoformat()
+            })
+    
+    # Sort by timestamp (oldest first)
+    all_pending.sort(key=lambda x: x['timestamp'])
+    
+    return {
+        "total_pending": len(all_pending),
+        "message": "These transactions require manual review. Use /approve or /reject endpoints to process.",
+        "pending_transactions": all_pending
     }
 
 
