@@ -4,9 +4,40 @@ Base URL: `http://127.0.0.1:8000`
 
 ---
 
+## User Flow Overview
+
+This API implements a **user self-confirmation flow** for fraud detection:
+
+```
+User initiates transfer in app
+            │
+            ▼
+   POST /api/v1/transaction/analyze
+            │
+    ┌───────┴───────┐
+    │               │
+APPROVED    AWAITING_USER_CONFIRMATION
+    │               │
+    ▼               ▼
+Transaction     Show warning to user:
+completes       "This looks unusual. Is this you?"
+                [Reasons displayed]
+                
+                [Confirm]     [Cancel]
+                    │             │
+                    ▼             ▼
+               /confirm       /cancel
+                    │             │
+                    ▼             ▼
+              Transaction    Transaction
+              processed      cancelled
+```
+
+---
+
 ## 1. Process Transaction
 
-Analyzes a transaction for fraud risk and determines whether it can proceed automatically or requires manual review.
+Analyzes a transaction for fraud risk. Returns immediately if safe, or asks user to confirm if unusual.
 
 **Endpoint:** `POST /api/v1/transaction/analyze`
 
@@ -37,12 +68,15 @@ Analyzes a transaction for fraud risk and determines whether it can proceed auto
 
 | Field | Type | Description |
 |-------|------|-------------|
-| status | string | APPROVED or PENDING_REVIEW |
+| status | string | APPROVED or AWAITING_USER_CONFIRMATION |
 | message | string | Status description |
-| risk_score | number | ML risk score (positive = risky) |
-| threshold | number | Monthly spending limit for this transfer type |
-| reasons | array | List of reasons if flagged |
-| flags | object | Which checks triggered |
+| risk_score | number | ML risk score (positive = unusual) |
+| risk_interpretation | string | Human-readable explanation of risk |
+| threshold | number | Monthly spending limit |
+| transfer_type | string | Transfer type evaluated |
+| applied_limit | number | Customer-specific limit for this transfer type |
+| reasons | array | List of reasons if flagged (show to user) |
+| flags | object | Which detection systems triggered |
 
 ### Response Flags
 
@@ -56,7 +90,7 @@ Analyzes a transaction for fraud risk and determines whether it can proceed auto
 
 ## Detection Examples
 
-### Case 1: APPROVED (All Checks Pass)
+### Case 1: APPROVED (Transaction Proceeds)
 ```json
 // Request
 {
@@ -67,12 +101,15 @@ Analyzes a transaction for fraud risk and determines whether it can proceed auto
     "bank_country": "UAE"
 }
 
-// Response
+// Response - Transaction completes immediately
 {
     "status": "APPROVED",
     "message": "Transaction is safe to process",
     "risk_score": -0.05,
+    "risk_interpretation": "Normal behavior - transaction pattern is consistent with user history",
     "threshold": 95544.61,
+    "transfer_type": "L",
+    "applied_limit": 95544.61,
     "reasons": [],
     "flags": {
         "rule_flag": false,
@@ -82,9 +119,9 @@ Analyzes a transaction for fraud risk and determines whether it can proceed auto
 }
 ```
 
-### Case 2: PENDING_REVIEW - Rule Engine Flag (Limit Exceeded)
+### Case 2: AWAITING_USER_CONFIRMATION (User Must Confirm)
 ```json
-// Request - Amount exceeds monthly limit
+// Request - Unusual overseas transfer
 {
     "customer_id": 4424492,
     "account_no": 14424492014,
@@ -93,12 +130,15 @@ Analyzes a transaction for fraud risk and determines whether it can proceed auto
     "bank_country": "Germany"
 }
 
-// Response
+// Response - Show confirmation screen to user
 {
-    "status": "PENDING_REVIEW",
-    "message": "Transaction requires manual approval",
+    "status": "AWAITING_USER_CONFIRMATION",
+    "message": "Unusual activity detected. Please confirm this transaction.",
     "risk_score": -0.03,
+    "risk_interpretation": "Normal behavior - transaction pattern is consistent with user history",
     "threshold": 65255.49,
+    "transfer_type": "S",
+    "applied_limit": 65255.49,
     "reasons": [
         "Monthly spending AED 66,464.77 exceeds limit AED 65,255.49"
     ],
@@ -110,76 +150,88 @@ Analyzes a transaction for fraud risk and determines whether it can proceed auto
 }
 ```
 
-### Case 3: PENDING_REVIEW - ML Flag (Anomaly Detected)
-```json
-// Request - Unusual pattern for this customer
-{
-    "customer_id": 1000016,
-    "account_no": 11000016019,
-    "amount": 50000,
-    "transfer_type": "S",
-    "ben_id": 999999,
-    "bank_country": "Nigeria"
-}
+**Frontend Action:** Display the `reasons` array to the user with "Confirm" and "Cancel" buttons.
 
-// Response
-{
-    "status": "PENDING_REVIEW",
-    "message": "Transaction requires manual approval",
-    "risk_score": 0.0347,
-    "threshold": 63772.26,
-    "reasons": [
-        "Monthly spending AED 411,740.07 exceeds limit AED 63,772.26",
-        "ML anomaly detected (risk score 0.0347)"
-    ],
-    "flags": {
-        "rule_flag": true,
-        "ml_flag": true,
-        "ae_flag": false
-    }
-}
+---
+
+## 2. User Confirms Transaction
+
+User confirms they initiated the flagged transaction.
+
+**Endpoint:** `POST /api/v1/pending/confirm/{customer_id}/{account_no}/{txn_id}`
+
+### Example
+```
+POST /api/v1/pending/confirm/4424492/14424492014/4424492_14424492014_20260101120000123456
 ```
 
-### Case 4: PENDING_REVIEW - Velocity Flag (Burst Transactions)
+### Response
 ```json
-// Request - 6th transaction within 10 minutes
 {
-    "customer_id": 1000016,
-    "account_no": 11000016019,
-    "amount": 1000,
-    "transfer_type": "O",
-    "bank_country": "UAE"
-}
-
-// Response
-{
-    "status": "PENDING_REVIEW",
-    "message": "Transaction requires manual approval",
-    "risk_score": -0.02,
-    "threshold": 125833.73,
-    "reasons": [
-        "Velocity limit exceeded: 6 transactions in last 10 minutes (max allowed 5)"
-    ],
-    "flags": {
-        "rule_flag": true,
-        "ml_flag": false,
-        "ae_flag": false
-    }
+    "status": "confirmed",
+    "message": "Transaction 4424492_14424492014_20260101120000123456 confirmed and processed",
+    "amount": 15000,
+    "transfer_type": "S"
 }
 ```
 
 ---
 
-## 2. Account Limits
+## 3. User Cancels Transaction
+
+User cancels a flagged transaction (doesn't recognize it or changed their mind).
+
+**Endpoint:** `POST /api/v1/pending/cancel/{customer_id}/{account_no}/{txn_id}`
+
+### Example
+```
+POST /api/v1/pending/cancel/4424492/14424492014/4424492_14424492014_20260101120000123456
+```
+
+### Response
+```json
+{
+    "status": "cancelled",
+    "message": "Transaction 4424492_14424492014_20260101120000123456 has been cancelled",
+    "amount": 15000,
+    "transfer_type": "S",
+    "warning": "If you did not initiate this transaction, please secure your account immediately."
+}
+```
+
+---
+
+## 4. Get Pending Transactions (User's Account)
+
+Get all transactions awaiting user confirmation for a specific account.
+
+**Endpoint:** `GET /api/v1/pending/{customer_id}/{account_no}`
+
+### Response
+```json
+{
+    "customer_id": 4424492,
+    "account_no": 14424492014,
+    "pending_count": 1,
+    "pending_transactions": [
+        {
+            "txn_id": "4424492_14424492014_20260101120000123456",
+            "amount": 15000,
+            "transfer_type": "S",
+            "reasons": ["Monthly spending exceeds limit"],
+            "timestamp": "2026-01-01T12:00:00.123456"
+        }
+    ]
+}
+```
+
+---
+
+## 5. Account Limits
 
 Get account spending and remaining limits for all transfer types.
 
 **Endpoint:** `GET /api/v1/account/limits/{customer_id}/{account_no}`
-
-### Example
-```
-GET /api/v1/account/limits/4424492/14424492014
-```
 
 ### Response
 ```json
@@ -203,30 +255,23 @@ GET /api/v1/account/limits/4424492/14424492014
 
 ---
 
-## 3. Pending Transactions
+## 6. Session Stats
 
-### Get Pending Transactions
-**Endpoint:** `GET /api/v1/pending/{customer_id}/{account_no}`
+Get current session statistics for debugging.
 
-### Approve Pending Transaction
-**Endpoint:** `POST /api/v1/pending/approve/{customer_id}/{account_no}/{txn_id}`
-
-### Reject Pending Transaction
-**Endpoint:** `POST /api/v1/pending/reject/{customer_id}/{account_no}/{txn_id}`
+**Endpoint:** `GET /api/v1/session/stats/{customer_id}/{account_no}`
 
 ---
 
-## 4. Session Management
+## 7. Clear Session
 
-### Get Session Stats
-**Endpoint:** `GET /api/v1/session/stats/{customer_id}/{account_no}`
+Clear all session data (for testing).
 
-### Clear Session
 **Endpoint:** `POST /api/v1/session/clear`
 
 ---
 
-## 5. Health Check
+## 8. Health Check
 
 **Endpoint:** `GET /health`
 
@@ -237,6 +282,16 @@ GET /api/v1/account/limits/4424492/14424492014
     "models_loaded": true
 }
 ```
+
+---
+
+## 9. Get All Pending (Audit/Monitoring)
+
+Get all transactions awaiting confirmation across all accounts.
+
+**Endpoint:** `GET /api/v1/pending/all`
+
+**Note:** This is for monitoring/audit purposes. Users confirm their own transactions.
 
 ---
 
@@ -252,33 +307,14 @@ GET /api/v1/account/limits/4424492/14424492014
 
 ---
 
-## Fraud Detection Flow
+## Transaction Statuses
 
-```
-Transaction Request
-       ↓
-┌──────────────────┐
-│   Rule Engine    │ → Velocity limits (5/10min, 15/hour)
-│                  │ → Monthly spending limits
-└────────┬─────────┘
-         ↓
-┌──────────────────┐
-│ Isolation Forest │ → 26 features analysis
-│      (ML)        │ → Anomaly detection
-└────────┬─────────┘
-         ↓
-┌──────────────────┐
-│   Autoencoder    │ → 31 features analysis
-│      (AE)        │ → Behavioral pattern check
-└────────┬─────────┘
-         ↓
-    Any Flag?
-    ↓       ↓
-   Yes      No
-    ↓       ↓
-PENDING   APPROVED
-REVIEW
-```
+| Status | Description | History Record |
+|--------|-------------|----------------|
+| APPROVED | Safe, processed immediately | "Approved" |
+| AWAITING_USER_CONFIRMATION | Unusual, needs user confirmation | "Awaiting Confirmation" |
+| (after confirm) | User confirmed | "User Confirmed" |
+| (after cancel) | User cancelled | "User Cancelled" |
 
 ---
 
@@ -289,32 +325,43 @@ cd frauduelent-transactions-detector
 uvicorn backend.api:app --reload
 ```
 
-API will be available at: `http://127.0.0.1:8000`
-
+API: `http://127.0.0.1:8000`
 Swagger Docs: `http://127.0.0.1:8000/docs`
 
 ---
 
-## Postman Collection Setup
+## Frontend Integration Guide
 
-Import `postman/Fraud_Detection_API.postman_collection.json` into Postman.
+### When `status === "APPROVED"`:
+- Show success message
+- Transaction is complete
 
-### Setting Variables
+### When `status === "AWAITING_USER_CONFIRMATION"`:
+1. Show confirmation dialog with:
+   - Warning message: "We detected unusual activity"
+   - Display `reasons` array as bullet points
+   - Transaction details (amount, transfer_type, etc.)
+2. Two buttons:
+   - "Yes, it's me" → Call `/confirm` endpoint
+   - "Cancel" → Call `/cancel` endpoint
+3. After user action, show appropriate result
 
-1. Click on "Fraud Detection API" collection name
-2. Go to "Variables" tab on the right side
-3. Set values for:
-   - `customer_id` - Customer ID to test
-   - `account_no` - Account number to test  
-   - `txn_id` - Transaction ID (for approve/reject pending)
-
-### Available Variables
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| baseURL | API base URL | http://127.0.0.1:8000 |
-| customer_id | Customer ID | 4424492 |
-| account_no | Account Number | 14424492014 |
-| txn_id | Pending Transaction ID | 4424492_14424492014_20251231... |
-
-You can also directly edit the URL in each request instead of using variables.
+### Example UI Flow:
+```
+┌─────────────────────────────────────────┐
+│  ⚠️ Unusual Activity Detected           │
+│                                         │
+│  We noticed something different about   │
+│  this transaction:                      │
+│                                         │
+│  • Monthly spending exceeds your limit  │
+│  • Transfer to new country (Germany)    │
+│                                         │
+│  Amount: AED 15,000                     │
+│  To: Germany                            │
+│                                         │
+│  Is this you?                           │
+│                                         │
+│  [Yes, proceed]     [No, cancel]        │
+└─────────────────────────────────────────┘
+```
