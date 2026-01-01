@@ -1,5 +1,3 @@
-"""Transaction Analysis API - FastAPI endpoint for fraud detection."""
-
 import os
 import pandas as pd
 from datetime import datetime, timedelta
@@ -43,15 +41,18 @@ class TransactionRequest(BaseModel):
 class TransactionResponse(BaseModel):
     status: str
     message: str
+    txn_id: Optional[str] = None  # Transaction ID for confirm/cancel (only when AWAITING_USER_CONFIRMATION)
     risk_score: float
+    risk_interpretation: str  # Explains what the risk score means
     threshold: float
+    transfer_type: str  # Which transfer type was evaluated
+    applied_limit: float  # Customer-specific limit for this transfer type
     reasons: list
     flags: dict
 
 
 @app.on_event("startup")
 def load_models():
-    """Load models and data on startup."""
     global model, features, scaler, autoencoder, df_features
     
     print("Loading models...")
@@ -66,7 +67,6 @@ def load_models():
 
 
 def get_account_stats(customer_id: float, account_no: float) -> dict:
-    """Get account-level statistics from featured_dataset.csv."""
     account_data = df_features[
         (df_features['CustomerId'] == customer_id) & 
         (df_features['FromAccountNo'] == account_no)
@@ -93,7 +93,6 @@ def get_account_stats(customer_id: float, account_no: float) -> dict:
 
 
 def add_to_session(customer_id: float, account_no: float, amount: float):
-    """Add APPROVED transaction to session store for real-time tracking."""
     key = (customer_id, account_no)
     now = datetime.now()
     
@@ -114,7 +113,6 @@ def add_to_session(customer_id: float, account_no: float, amount: float):
 
 def add_to_pending(customer_id: float, account_no: float, amount: float, 
                    transfer_type: str, ben_id: float, bank_country: str, reasons: list):
-    """Add transaction to pending store (waiting for manual approval)."""
     key = (customer_id, account_no)
     now = datetime.now()
     
@@ -138,7 +136,6 @@ def add_to_pending(customer_id: float, account_no: float, amount: float,
 
 def save_to_history(customer_id: float, account_no: float, amount: float, 
                     transfer_type: str, status: str):
-    """Save transaction to transaction_history.csv."""
     now = datetime.now()
     
     # Create file if not exists
@@ -152,7 +149,6 @@ def save_to_history(customer_id: float, account_no: float, amount: float,
 
 
 def get_session_velocity(customer_id: float, account_no: float) -> dict:
-    """Get real-time velocity from session store."""
     key = (customer_id, account_no)
     now = datetime.now()
     
@@ -192,7 +188,6 @@ def get_session_velocity(customer_id: float, account_no: float) -> dict:
 
 
 def get_velocity_stats(customer_id: float, account_no: float) -> dict:
-    """Get combined velocity statistics (historical + session)."""
     # Get historical from CSV
     account_data = df_features[
         (df_features['CustomerId'] == customer_id) & 
@@ -222,7 +217,6 @@ def get_velocity_stats(customer_id: float, account_no: float) -> dict:
 
 
 def get_beneficiary_stats(ben_id: float) -> dict:
-    """Get beneficiary statistics."""
     if ben_id is None or ben_id <= 0:
         return {'is_new_beneficiary': 1, 'beneficiary_txn_count_30d': 0, 'beneficiary_risk_score': 0.5}
     
@@ -243,10 +237,19 @@ def get_beneficiary_stats(ben_id: float) -> dict:
 @app.post("/api/v1/transaction/analyze", response_model=TransactionResponse)
 def analyze_transaction(request: TransactionRequest):
     """
-    Analyze a transaction and return APPROVED or PENDING_REVIEW.
+    Analyze a transaction and return APPROVED or AWAITING_USER_CONFIRMATION.
     
-    - APPROVED: Transaction is safe to process (added to session + saved to history)
-    - PENDING_REVIEW: Transaction needs manual approval (NOT added to session yet)
+    **User Flow:** This endpoint is called when a user initiates a transfer.
+    If the transaction looks unusual, the user is asked to confirm it's really them.
+    
+    **Statuses:**
+    - APPROVED: Transaction is safe, processed immediately
+    - AWAITING_USER_CONFIRMATION: Unusual activity detected, user must confirm
+    
+    **Risk Score:** Anomaly signal from ML models (negative = normal, positive = unusual)
+    
+    **Frontend Integration:** When status is AWAITING_USER_CONFIRMATION, show the 
+    reasons to the user and ask them to confirm or cancel the transaction.
     """
     # Get account stats
     user_stats = get_account_stats(request.customer_id, request.account_no)
@@ -292,31 +295,54 @@ def analyze_transaction(request: TransactionRequest):
     
     # Determine status and handle accordingly
     if result['is_fraud']:
-        status = "PENDING_REVIEW"
-        message = "Transaction requires manual approval"
+        status = "AWAITING_USER_CONFIRMATION"
+        message = "Unusual activity detected. Please confirm this transaction."
         # Add to pending (NOT to session)
         txn_id = add_to_pending(
             request.customer_id, request.account_no, request.amount,
             request.transfer_type.upper(), request.ben_id or 0, 
             request.bank_country, result['reasons']
         )
-        # Save to history as Pending
+        # Save to history as Awaiting Confirmation
         save_to_history(request.customer_id, request.account_no, request.amount,
-                       request.transfer_type.upper(), "Pending")
+                       request.transfer_type.upper(), "Awaiting Confirmation")
     else:
         status = "APPROVED"
         message = "Transaction is safe to process"
+        txn_id = None  # No txn_id needed for approved transactions
         # Add to session (for velocity tracking)
         add_to_session(request.customer_id, request.account_no, request.amount)
         # Save to history as Approved
         save_to_history(request.customer_id, request.account_no, request.amount,
                        request.transfer_type.upper(), "Approved")
     
+    # Calculate customer-specific limit for this transfer type
+    from backend.rule_engine import calculate_threshold
+    applied_limit = calculate_threshold(
+        user_stats['user_avg_amount'], 
+        user_stats['user_std_amount'], 
+        request.transfer_type.upper()
+    )
+    
+    # Generate risk interpretation
+    if result['risk_score'] < 0:
+        risk_interpretation = "Normal behavior - transaction pattern is consistent with user history"
+    elif result['risk_score'] < 0.5:
+        risk_interpretation = "Slightly unusual - minor deviation from typical behavior"
+    elif result['risk_score'] < 1.0:
+        risk_interpretation = "Moderately unusual - noticeable deviation from typical behavior"
+    else:
+        risk_interpretation = "Highly unusual - significant anomaly detected in transaction pattern"
+    
     return TransactionResponse(
         status=status,
         message=message,
+        txn_id=txn_id,
         risk_score=result['risk_score'],
+        risk_interpretation=risk_interpretation,
         threshold=result['threshold'],
+        transfer_type=request.transfer_type.upper(),
+        applied_limit=round(applied_limit, 2),
         reasons=result['reasons'],
         flags={
             'rule_flag': len([r for r in result['reasons'] if 'Velocity' in r or 'spending' in r]) > 0,
@@ -328,11 +354,6 @@ def analyze_transaction(request: TransactionRequest):
 
 @app.get("/api/v1/account/limits/{customer_id}/{account_no}")
 def get_account_limits(customer_id: float, account_no: float):
-    """
-    Get account spending and remaining limits for all transfer types.
-    
-    Returns current month spending (including session) and remaining limit for S, I, L, Q, O transfers.
-    """
     from backend.rule_engine import calculate_all_limits
     
     user_stats = get_account_stats(customer_id, account_no)
@@ -374,13 +395,11 @@ def get_account_limits(customer_id: float, account_no: float):
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint."""
     return {"status": "healthy", "models_loaded": model is not None}
 
 
 @app.post("/api/v1/session/clear")
 def clear_session():
-    """Clear all session transactions (for testing)."""
     global session_transactions, pending_transactions
     session_transactions = {}
     pending_transactions = {}
@@ -389,7 +408,12 @@ def clear_session():
 
 @app.get("/api/v1/pending/{customer_id}/{account_no}")
 def get_pending_transactions(customer_id: float, account_no: float):
-    """Get all pending transactions for an account."""
+    """
+    Get all transactions awaiting user confirmation for an account.
+    
+    **User Flow:** Call this to show the user their pending transactions
+    that need confirmation before processing.
+    """
     key = (customer_id, account_no)
     pending = pending_transactions.get(key, [])
     
@@ -410,9 +434,51 @@ def get_pending_transactions(customer_id: float, account_no: float):
     }
 
 
-@app.post("/api/v1/pending/approve/{customer_id}/{account_no}/{txn_id}")
-def approve_pending_transaction(customer_id: float, account_no: float, txn_id: str):
-    """Manually approve a pending transaction."""
+@app.get("/api/v1/pending/all")
+def get_all_pending_transactions():
+    """
+    Get ALL transactions awaiting confirmation across all accounts.
+    
+    **For Audit/Monitoring:** This endpoint returns all transactions
+    currently awaiting user confirmation. Useful for monitoring and analytics.
+    """
+    all_pending = []
+    
+    for (customer_id, account_no), txns in pending_transactions.items():
+        for t in txns:
+            all_pending.append({
+                "customer_id": customer_id,
+                "account_no": account_no,
+                "txn_id": t['txn_id'],
+                "amount": t['amount'],
+                "transfer_type": t['transfer_type'],
+                "bank_country": t.get('bank_country', 'Unknown'),
+                "reasons": t['reasons'],
+                "timestamp": t['timestamp'].isoformat()
+            })
+    
+    # Sort by timestamp (oldest first)
+    all_pending.sort(key=lambda x: x['timestamp'])
+    
+    return {
+        "total_pending": len(all_pending),
+        "message": "Transactions awaiting user confirmation. Users confirm via /confirm or /cancel endpoints.",
+        "pending_transactions": all_pending
+    }
+
+
+@app.post("/api/v1/pending/confirm/{customer_id}/{account_no}/{txn_id}")
+def confirm_pending_transaction(customer_id: float, account_no: float, txn_id: str):
+    """
+    User confirms a flagged transaction.
+    
+    **User Flow:** When a transaction is flagged as unusual, the user sees
+    a confirmation screen with the reasons. If they confirm "Yes, it's me", 
+    call this endpoint to proceed with the transaction.
+    
+    Note: Auth verification should be handled by your company's auth layer
+    before this endpoint is called.
+    """
     key = (customer_id, account_no)
     
     if key not in pending_transactions:
@@ -435,19 +501,25 @@ def approve_pending_transaction(customer_id: float, account_no: float, txn_id: s
     add_to_session(customer_id, account_no, txn['amount'])
     
     # Update history status
-    save_to_history(customer_id, account_no, txn['amount'], txn['transfer_type'], "Force Approved")
+    save_to_history(customer_id, account_no, txn['amount'], txn['transfer_type'], "User Confirmed")
     
     return {
-        "status": "approved",
-        "message": f"Transaction {txn_id} has been approved",
+        "status": "confirmed",
+        "message": f"Transaction {txn_id} confirmed and processed",
         "amount": txn['amount'],
         "transfer_type": txn['transfer_type']
     }
 
 
-@app.post("/api/v1/pending/reject/{customer_id}/{account_no}/{txn_id}")
-def reject_pending_transaction(customer_id: float, account_no: float, txn_id: str):
-    """Reject a pending transaction."""
+@app.post("/api/v1/pending/cancel/{customer_id}/{account_no}/{txn_id}")
+def cancel_pending_transaction(customer_id: float, account_no: float, txn_id: str):
+    """
+    User cancels a flagged transaction.
+    
+    **User Flow:** When a transaction is flagged as unusual, if the user
+    doesn't recognize it or wants to cancel, they call this endpoint.
+    This may indicate unauthorized access to their account.
+    """
     key = (customer_id, account_no)
     
     if key not in pending_transactions:
@@ -467,19 +539,19 @@ def reject_pending_transaction(customer_id: float, account_no: float, txn_id: st
     pending_transactions[key] = [t for t in pending_transactions[key] if t['txn_id'] != txn_id]
     
     # Update history status
-    save_to_history(customer_id, account_no, txn['amount'], txn['transfer_type'], "Rejected")
+    save_to_history(customer_id, account_no, txn['amount'], txn['transfer_type'], "User Cancelled")
     
     return {
-        "status": "rejected",
-        "message": f"Transaction {txn_id} has been rejected",
+        "status": "cancelled",
+        "message": f"Transaction {txn_id} has been cancelled",
         "amount": txn['amount'],
-        "transfer_type": txn['transfer_type']
+        "transfer_type": txn['transfer_type'],
+        "warning": "If you did not initiate this transaction, please secure your account immediately."
     }
 
 
 @app.get("/api/v1/session/stats/{customer_id}/{account_no}")
 def get_session_stats(customer_id: float, account_no: float):
-    """Get current session stats for an account (for debugging)."""
     velocity = get_session_velocity(customer_id, account_no)
     key = (customer_id, account_no)
     txn_count = len(session_transactions.get(key, []))

@@ -43,7 +43,8 @@
 				"body": {
 					"mode": "raw",
 					"raw": "{\n    \"customer_id\": 4424492,\n    \"account_no\": 14424492014,\n    \"amount\": 5000,\n    \"transfer_type\": \"S\",\n    \"ben_id\": 2584644,\n    \"bank_country\": \"Germany\"\n}"
-				}
+				},
+				"description": "Analyze a transaction. Returns APPROVED or AWAITING_USER_CONFIRMATION."
 			}
 		},
 		{
@@ -68,24 +69,35 @@
 			}
 		},
 		{
-			"name": "Get Pending Transactions",
+			"name": "Get Pending Transactions (User Account)",
 			"request": {
 				"method": "GET",
-				"url": "{{baseURL}}/api/v1/pending/{{customer_id}}/{{account_no}}"
+				"url": "{{baseURL}}/api/v1/pending/{{customer_id}}/{{account_no}}",
+				"description": "Get transactions awaiting user confirmation for a specific account."
 			}
 		},
 		{
-			"name": "Approve Pending Transaction",
+			"name": "Get ALL Pending Transactions (Audit)",
 			"request": {
-				"method": "POST",
-				"url": "{{baseURL}}/api/v1/pending/approve/{{customer_id}}/{{account_no}}/{{txn_id}}"
+				"method": "GET",
+				"url": "{{baseURL}}/api/v1/pending/all",
+				"description": "For Audit/Monitoring: Returns ALL transactions awaiting user confirmation across all accounts."
 			}
 		},
 		{
-			"name": "Reject Pending Transaction",
+			"name": "Confirm Pending Transaction (User)",
 			"request": {
 				"method": "POST",
-				"url": "{{baseURL}}/api/v1/pending/reject/{{customer_id}}/{{account_no}}/{{txn_id}}"
+				"url": "{{baseURL}}/api/v1/pending/confirm/{{customer_id}}/{{account_no}}/{{txn_id}}",
+				"description": "User confirms a flagged transaction - 'Yes, it's me'. Transaction will be processed."
+			}
+		},
+		{
+			"name": "Cancel Pending Transaction (User)",
+			"request": {
+				"method": "POST",
+				"url": "{{baseURL}}/api/v1/pending/cancel/{{customer_id}}/{{account_no}}/{{txn_id}}",
+				"description": "User cancels a flagged transaction - they don't recognize it or changed their mind."
 			}
 		}
 	]
