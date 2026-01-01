@@ -25,14 +25,7 @@ def load_data():
     if os.path.exists(DATA_PATH):
         return pd.read_csv(DATA_PATH)
     return None
-
-
-# def delete_old_models():
-#     for path in [MODEL_PATH, SCALER_PATH]:
-#         if os.path.exists(path):
-#             os.remove(path)
-
-
+    
 def train_model():
     print("=" * 50)
     print("ISOLATION FOREST MODEL TRAINING")
